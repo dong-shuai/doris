@@ -182,8 +182,9 @@ TEST_F(TestEngineStorageMigrationTask, write_and_migration) {
     PUniqueId load_id;
     load_id.set_hi(0);
     load_id.set_lo(0);
-    WriteRequest write_req = {10005,   270068377,  WriteType::LOAD,        20003, 30003,
-                              load_id, tuple_desc, &(tuple_desc->slots()), false, &param};
+    WriteRequest write_req = {
+            10005, 270068377, 20003, 30003, load_id, tuple_desc, &(tuple_desc->slots()),
+            false, &param};
     DeltaWriter* delta_writer = nullptr;
 
     std::unique_ptr<RuntimeProfile> profile;
@@ -193,7 +194,9 @@ TEST_F(TestEngineStorageMigrationTask, write_and_migration) {
 
     res = delta_writer->close();
     EXPECT_EQ(Status::OK(), res);
-    res = delta_writer->close_wait(PSlaveTabletNodes(), false);
+    res = delta_writer->build_rowset();
+    EXPECT_EQ(Status::OK(), res);
+    res = delta_writer->commit_txn(PSlaveTabletNodes(), false);
     EXPECT_EQ(Status::OK(), res);
 
     // publish version success

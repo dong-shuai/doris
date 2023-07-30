@@ -19,7 +19,6 @@
 
 #include <aws/core/auth/AWSAuthSigner.h>
 #include <aws/core/auth/AWSCredentials.h>
-#include <aws/core/client/ClientConfiguration.h>
 #include <aws/core/utils/logging/LogLevel.h>
 #include <aws/core/utils/logging/LogSystemInterface.h>
 #include <aws/core/utils/memory/stl/AWSStringStream.h>
@@ -141,12 +140,15 @@ std::shared_ptr<Aws::S3::S3Client> S3ClientFactory::create(const S3Conf& s3_conf
     Aws::Auth::AWSCredentials aws_cred(s3_conf.ak, s3_conf.sk);
     DCHECK(!aws_cred.IsExpiredOrEmpty());
 
-    Aws::Client::ClientConfiguration aws_config;
+    Aws::Client::ClientConfiguration aws_config = S3ClientFactory::getClientConfiguration();
     aws_config.endpointOverride = s3_conf.endpoint;
     aws_config.region = s3_conf.region;
     if (s3_conf.max_connections > 0) {
         aws_config.maxConnections = s3_conf.max_connections;
+    } else {
+        aws_config.maxConnections = config::doris_remote_scanner_thread_pool_thread_num;
     }
+
     if (s3_conf.request_timeout_ms > 0) {
         aws_config.requestTimeoutMs = s3_conf.request_timeout_ms;
     }

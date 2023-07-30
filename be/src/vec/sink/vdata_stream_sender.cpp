@@ -134,7 +134,7 @@ Status Channel::send_local_block(bool eos) {
         return Status::OK();
     } else {
         _mutable_block.reset();
-        return receiver_status_;
+        return _receiver_status;
     }
 }
 
@@ -147,7 +147,7 @@ Status Channel::send_local_block(Block* block) {
         _local_recvr->add_block(block, _parent->_sender_id, false);
         return Status::OK();
     } else {
-        return receiver_status_;
+        return _receiver_status;
     }
 }
 
@@ -256,8 +256,8 @@ Status Channel::close_internal() {
     VLOG_RPC << "Channel::close() instance_id=" << _fragment_instance_id
              << " dest_node=" << _dest_node_id
              << " #rows= " << ((_mutable_block == nullptr) ? 0 : _mutable_block->rows())
-             << " receiver status: " << receiver_status_;
-    if (receiver_status_.is<ErrorCode::END_OF_FILE>()) {
+             << " receiver status: " << _receiver_status;
+    if (is_receiver_eof()) {
         _mutable_block.reset();
         return Status::OK();
     }
@@ -266,7 +266,13 @@ Status Channel::close_internal() {
         status = send_current_block(true);
     } else {
         SCOPED_CONSUME_MEM_TRACKER(_parent->_mem_tracker.get());
-        status = send_block((PBlock*)nullptr, true);
+        if (is_local()) {
+            if (_recvr_is_valid()) {
+                _local_recvr->remove_sender(_parent->_sender_id, _be_number);
+            }
+        } else {
+            status = send_block((PBlock*)nullptr, true);
+        }
     }
     // Don't wait for the last packet to finish, left it to close_wait.
     if (status.is<ErrorCode::END_OF_FILE>()) {
@@ -465,9 +471,6 @@ Status VDataStreamSender::prepare(RuntimeState* state) {
         shuffle(_channels.begin(), _channels.end(), g);
     } else if (_part_type == TPartitionType::HASH_PARTITIONED ||
                _part_type == TPartitionType::BUCKET_SHFFULE_HASH_PARTITIONED) {
-        if (_state->query_options().__isset.enable_new_shuffle_hash_method) {
-            _new_shuffle_hash_method = _state->query_options().enable_new_shuffle_hash_method;
-        }
         RETURN_IF_ERROR(VExpr::prepare(_partition_expr_ctxs, state, _row_desc));
     } else {
         RETURN_IF_ERROR(VExpr::prepare(_partition_expr_ctxs, state, _row_desc));
@@ -624,31 +627,16 @@ Status VDataStreamSender::send(RuntimeState* state, Block* block, bool eos) {
 
         // TODO: after we support new shuffle hash method, should simple the code
         if (_part_type == TPartitionType::HASH_PARTITIONED) {
-            if (!_new_shuffle_hash_method) {
-                SCOPED_TIMER(_split_block_hash_compute_timer);
-                // for each row, we have a siphash val
-                std::vector<SipHash> siphashs(rows);
-                // result[j] means column index, i means rows index
-                for (int j = 0; j < result_size; ++j) {
-                    // complex type most not implement get_data_at() method which column_const will call
-                    unpack_if_const(block->get_by_position(result[j]).column)
-                            .first->update_hashes_with_value(siphashs);
-                }
-                for (int i = 0; i < rows; i++) {
-                    hashes[i] = siphashs[i].get64() % element_size;
-                }
-            } else {
-                SCOPED_TIMER(_split_block_hash_compute_timer);
-                // result[j] means column index, i means rows index, here to calculate the xxhash value
-                for (int j = 0; j < result_size; ++j) {
-                    // complex type most not implement get_data_at() method which column_const will call
-                    unpack_if_const(block->get_by_position(result[j]).column)
-                            .first->update_hashes_with_value(hashes);
-                }
+            SCOPED_TIMER(_split_block_hash_compute_timer);
+            // result[j] means column index, i means rows index, here to calculate the xxhash value
+            for (int j = 0; j < result_size; ++j) {
+                // complex type most not implement get_data_at() method which column_const will call
+                unpack_if_const(block->get_by_position(result[j]).column)
+                        .first->update_hashes_with_value(hashes);
+            }
 
-                for (int i = 0; i < rows; i++) {
-                    hashes[i] = hashes[i] % element_size;
-                }
+            for (int i = 0; i < rows; i++) {
+                hashes[i] = hashes[i] % element_size;
             }
 
             {
@@ -684,11 +672,7 @@ Status VDataStreamSender::send(RuntimeState* state, Block* block, bool eos) {
     return Status::OK();
 }
 
-Status VDataStreamSender::close(RuntimeState* state, Status exec_status) {
-    if (_closed) {
-        return Status::OK();
-    }
-
+Status VDataStreamSender::try_close(RuntimeState* state, Status exec_status) {
     Status final_st = Status::OK();
     for (int i = 0; i < _channels.size(); ++i) {
         Status st = _channels[i]->close(state);
@@ -696,13 +680,31 @@ Status VDataStreamSender::close(RuntimeState* state, Status exec_status) {
             final_st = st;
         }
     }
-    // wait all channels to finish
-    for (int i = 0; i < _channels.size(); ++i) {
-        Status st = _channels[i]->close_wait(state);
-        if (!st.ok() && final_st.ok()) {
-            final_st = st;
+    return final_st;
+}
+
+Status VDataStreamSender::close(RuntimeState* state, Status exec_status) {
+    if (_closed) {
+        return Status::OK();
+    }
+
+    Status final_st = Status::OK();
+    if (!state->enable_pipeline_exec()) {
+        for (int i = 0; i < _channels.size(); ++i) {
+            Status st = _channels[i]->close(state);
+            if (!st.ok() && final_st.ok()) {
+                final_st = st;
+            }
+        }
+        // wait all channels to finish
+        for (int i = 0; i < _channels.size(); ++i) {
+            Status st = _channels[i]->close_wait(state);
+            if (!st.ok() && final_st.ok()) {
+                final_st = st;
+            }
         }
     }
+
     DataSink::close(state, exec_status);
     return final_st;
 }

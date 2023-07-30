@@ -17,6 +17,7 @@
 
 package org.apache.doris.planner.external;
 
+import org.apache.doris.analysis.FunctionCallExpr;
 import org.apache.doris.analysis.SlotDescriptor;
 import org.apache.doris.analysis.TupleDescriptor;
 import org.apache.doris.catalog.Column;
@@ -67,7 +68,12 @@ public class HiveScanNode extends FileQueryScanNode {
 
     public static final String PROP_FIELD_DELIMITER = "field.delim";
     public static final String DEFAULT_FIELD_DELIMITER = "\1"; // "\x01"
+    public static final String PROP_LINE_DELIMITER = "line.delim";
     public static final String DEFAULT_LINE_DELIMITER = "\n";
+
+    public static final String PROP_ARRAY_DELIMITER_HIVE2 = "colelction.delim";
+    public static final String PROP_ARRAY_DELIMITER_HIVE3 = "collection.delim";
+    public static final String DEFAULT_ARRAY_DELIMITER = "\2";
 
     protected final HMSExternalTable hmsTable;
     private HiveTransaction hiveTransaction = null;
@@ -98,14 +104,13 @@ public class HiveScanNode extends FileQueryScanNode {
         String inputFormat = hmsTable.getRemoteTable().getSd().getInputFormat();
         if (inputFormat.contains("TextInputFormat")) {
             for (SlotDescriptor slot : desc.getSlots()) {
-                if (!slot.getType().isScalarType()) {
+                if (slot.getType().isMapType() || slot.getType().isStructType()) {
                     throw new UserException("For column `" + slot.getColumn().getName()
-                            + "`, The column types ARRAY/MAP/STRUCT are not supported yet"
-                            + " for text input format of Hive. ");
+                        + "`, The column types MAP/STRUCT are not supported yet"
+                        + " for text input format of Hive. ");
                 }
             }
         }
-
         if (hmsTable.isHiveTransactionalTable()) {
             this.hiveTransaction = new HiveTransaction(DebugUtil.printId(ConnectContext.get().queryId()),
                     ConnectContext.get().getQualifiedUser(), hmsTable, hmsTable.isFullAcidTable());
@@ -145,7 +150,12 @@ public class HiveScanNode extends FileQueryScanNode {
                 ListPartitionItem listPartitionItem = (ListPartitionItem) idToPartitionItem.get(id);
                 partitionValuesList.add(listPartitionItem.getItems().get(0).getPartitionValuesAsStringList());
             }
-            return cache.getAllPartitions(hmsTable.getDbName(), hmsTable.getName(), partitionValuesList);
+            List<HivePartition> allPartitions =
+                     cache.getAllPartitions(hmsTable.getDbName(), hmsTable.getName(), partitionValuesList);
+            if (ConnectContext.get().getExecutor() != null) {
+                ConnectContext.get().getExecutor().getSummaryProfile().setGetPartitionsFinishTime();
+            }
+            return allPartitions;
         } else {
             // unpartitioned table, create a dummy partition to save location and inputformat,
             // so that we can unify the interface.
@@ -154,6 +164,9 @@ public class HiveScanNode extends FileQueryScanNode {
                     hmsTable.getRemoteTable().getSd().getLocation(), null);
             this.totalPartitionNum = 1;
             this.readPartitionNum = 1;
+            if (ConnectContext.get().getExecutor() != null) {
+                ConnectContext.get().getExecutor().getSummaryProfile().setGetPartitionsFinishTime();
+            }
             return Lists.newArrayList(dummyPartition);
         }
     }
@@ -186,6 +199,9 @@ public class HiveScanNode extends FileQueryScanNode {
         } else {
             fileCaches = cache.getFilesByPartitions(partitions, useSelfSplitter);
         }
+        if (ConnectContext.get().getExecutor() != null) {
+            ConnectContext.get().getExecutor().getSummaryProfile().setGetPartitionFilesFinishTime();
+        }
         for (HiveMetaStoreCache.FileCacheValue fileCacheValue : fileCaches) {
             // This if branch is to support old splitter, will remove later.
             if (fileCacheValue.getSplits() != null) {
@@ -213,7 +229,7 @@ public class HiveScanNode extends FileQueryScanNode {
         }
         ValidWriteIdList validWriteIds = hiveTransaction.getValidWriteIds(
                 ((HMSExternalCatalog) hmsTable.getCatalog()).getClient());
-        return cache.getFilesByTransaction(partitions, validWriteIds, hiveTransaction.isFullAcid());
+        return cache.getFilesByTransaction(partitions, validWriteIds, hiveTransaction.isFullAcid(), hmsTable.getId());
     }
 
     @Override
@@ -262,9 +278,16 @@ public class HiveScanNode extends FileQueryScanNode {
     @Override
     protected TFileAttributes getFileAttributes() throws UserException {
         TFileTextScanRangeParams textParams = new TFileTextScanRangeParams();
-        textParams.setColumnSeparator(hmsTable.getRemoteTable().getSd().getSerdeInfo().getParameters()
-                .getOrDefault(PROP_FIELD_DELIMITER, DEFAULT_FIELD_DELIMITER));
-        textParams.setLineDelimiter(DEFAULT_LINE_DELIMITER);
+        java.util.Map<String, String> delimiter = hmsTable.getRemoteTable().getSd().getSerdeInfo().getParameters();
+        textParams.setColumnSeparator(delimiter.getOrDefault(PROP_FIELD_DELIMITER, DEFAULT_FIELD_DELIMITER));
+        textParams.setLineDelimiter(delimiter.getOrDefault(PROP_LINE_DELIMITER, DEFAULT_LINE_DELIMITER));
+        if (delimiter.get(PROP_ARRAY_DELIMITER_HIVE2) != null) {
+            textParams.setArrayDelimiter(delimiter.get(PROP_ARRAY_DELIMITER_HIVE2));
+        } else if (delimiter.get(PROP_ARRAY_DELIMITER_HIVE3) != null) {
+            textParams.setArrayDelimiter(delimiter.get(PROP_ARRAY_DELIMITER_HIVE3));
+        } else {
+            textParams.setArrayDelimiter(DEFAULT_ARRAY_DELIMITER);
+        }
         TFileAttributes fileAttributes = new TFileAttributes();
         fileAttributes.setTextParams(textParams);
         fileAttributes.setHeaderType("");
@@ -286,5 +309,20 @@ public class HiveScanNode extends FileQueryScanNode {
             }
         }
         params.setSlotNameToSchemaPos(columnNameToPosition);
+    }
+
+    @Override
+    public boolean pushDownAggNoGrouping(FunctionCallExpr aggExpr) {
+
+        String aggFunctionName = aggExpr.getFnName().getFunction();
+        if (aggFunctionName.equalsIgnoreCase("COUNT")) {
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    public boolean pushDownAggNoGroupingCheckCol(FunctionCallExpr aggExpr, Column col) {
+        return !col.isAllowNull();
     }
 }

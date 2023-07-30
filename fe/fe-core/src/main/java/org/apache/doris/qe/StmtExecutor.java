@@ -20,6 +20,7 @@ package org.apache.doris.qe;
 import org.apache.doris.analysis.AddPartitionLikeClause;
 import org.apache.doris.analysis.AlterClause;
 import org.apache.doris.analysis.AlterTableStmt;
+import org.apache.doris.analysis.AnalyzeDBStmt;
 import org.apache.doris.analysis.AnalyzeStmt;
 import org.apache.doris.analysis.AnalyzeTblStmt;
 import org.apache.doris.analysis.Analyzer;
@@ -96,6 +97,7 @@ import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.common.NereidsException;
 import org.apache.doris.common.UserException;
+import org.apache.doris.common.Version;
 import org.apache.doris.common.profile.Profile;
 import org.apache.doris.common.profile.SummaryProfile;
 import org.apache.doris.common.profile.SummaryProfile.SummaryBuilder;
@@ -295,6 +297,8 @@ public class StmtExecutor {
         long currentTimestamp = System.currentTimeMillis();
         SummaryBuilder builder = new SummaryBuilder();
         builder.profileId(DebugUtil.printId(context.queryId()));
+        builder.dorisVersion(
+                Version.DORIS_BUILD_VERSION_MAJOR == 0 ? Version.DORIS_BUILD_VERSION : Version.DORIS_BUILD_SHORT_HASH);
         builder.taskType(profileType.name());
         builder.startTime(TimeUtils.longToTimeString(context.getStartTime()));
         if (isFinished) {
@@ -563,6 +567,7 @@ public class StmtExecutor {
 
     private void handleQueryWithRetry(TUniqueId queryId) throws Exception {
         // queue query here
+        syncJournalIfNeeded();
         if (!parsedStmt.isExplain() && Config.enable_workload_group && Config.enable_query_queue
                 && context.getSessionVariable().getEnablePipelineEngine()) {
             this.queryQueue = context.getEnv().getWorkloadGroupMgr().getWorkloadGroupQueryQueue(context);
@@ -781,6 +786,14 @@ public class StmtExecutor {
                 }
             }
         }
+    }
+
+    private void syncJournalIfNeeded() throws Exception {
+        final Env env = context.getEnv();
+        if (env.isMaster() || !context.getSessionVariable().enableStrongConsistencyRead) {
+            return;
+        }
+        new MasterOpExecutor(context).syncJournal();
     }
 
     /**
@@ -1088,6 +1101,7 @@ public class StmtExecutor {
                 }
                 // query re-analyze
                 parsedStmt.reset();
+                analyzer.setReAnalyze(true);
                 parsedStmt.analyze(analyzer);
 
                 // Restore the original result types and column labels.
@@ -1136,7 +1150,7 @@ public class StmtExecutor {
         if (mysqlLoadId != null) {
             Env.getCurrentEnv().getLoadManager().getMysqlLoadManager().cancelMySqlLoad(mysqlLoadId);
         }
-        if (parsedStmt instanceof AnalyzeTblStmt) {
+        if (parsedStmt instanceof AnalyzeTblStmt || parsedStmt instanceof AnalyzeDBStmt) {
             Env.getCurrentEnv().getAnalysisManager().cancelSyncTask(context);
         }
     }
@@ -1186,7 +1200,7 @@ public class StmtExecutor {
     // the meta fields must be sent right before the first batch of data(or eos flag).
     // so if it has data(or eos is true), this method must return true.
     private boolean sendCachedValues(MysqlChannel channel, List<InternalService.PCacheValue> cacheValues,
-            SelectStmt selectStmt, boolean isSendFields, boolean isEos)
+            Queriable selectStmt, boolean isSendFields, boolean isEos)
             throws Exception {
         RowBatch batch = null;
         boolean isSend = isSendFields;
@@ -1228,25 +1242,25 @@ public class StmtExecutor {
     /**
      * Handle the SelectStmt via Cache.
      */
-    private void handleCacheStmt(CacheAnalyzer cacheAnalyzer, MysqlChannel channel, SelectStmt selectStmt)
+    private void handleCacheStmt(CacheAnalyzer cacheAnalyzer, MysqlChannel channel)
             throws Exception {
         InternalService.PFetchCacheResult cacheResult = cacheAnalyzer.getCacheData();
         CacheMode mode = cacheAnalyzer.getCacheMode();
-        SelectStmt newSelectStmt = selectStmt;
+        Queriable queryStmt = (Queriable) parsedStmt;
         boolean isSendFields = false;
         if (cacheResult != null) {
             isCached = true;
             if (cacheAnalyzer.getHitRange() == Cache.HitRange.Full) {
-                sendCachedValues(channel, cacheResult.getValuesList(), newSelectStmt, isSendFields, true);
+                sendCachedValues(channel, cacheResult.getValuesList(), queryStmt, isSendFields, true);
                 return;
             }
             // rewrite sql
             if (mode == CacheMode.Partition) {
                 if (cacheAnalyzer.getHitRange() == Cache.HitRange.Left) {
                     isSendFields = sendCachedValues(channel, cacheResult.getValuesList(),
-                            newSelectStmt, isSendFields, false);
+                            queryStmt, isSendFields, false);
                 }
-                newSelectStmt = cacheAnalyzer.getRewriteStmt();
+                StatementBase newSelectStmt = cacheAnalyzer.getRewriteStmt();
                 newSelectStmt.reset();
                 analyzer = new Analyzer(context.getEnv(), context);
                 newSelectStmt.analyze(analyzer);
@@ -1258,7 +1272,7 @@ public class StmtExecutor {
                 planner.plan(newSelectStmt, context.getSessionVariable().toThrift());
             }
         }
-        sendResult(false, isSendFields, newSelectStmt, channel, cacheAnalyzer, cacheResult);
+        sendResult(false, isSendFields, queryStmt, channel, cacheAnalyzer, cacheResult);
     }
 
     private boolean handleSelectRequestInFe(SelectStmt parsedSelectStmt) throws IOException {
@@ -1328,9 +1342,13 @@ public class StmtExecutor {
 
         // Sql and PartitionCache
         CacheAnalyzer cacheAnalyzer = new CacheAnalyzer(context, parsedStmt, planner);
-        if (cacheAnalyzer.enableCache() && !isOutfileQuery && queryStmt instanceof SelectStmt) {
-            handleCacheStmt(cacheAnalyzer, channel, (SelectStmt) queryStmt);
-            return;
+        if (cacheAnalyzer.enableCache() && !isOutfileQuery
+                && context.getSessionVariable().getSqlSelectLimit() < 0
+                && context.getSessionVariable().getDefaultOrderByLimit() < 0) {
+            if (queryStmt instanceof QueryStmt || queryStmt instanceof LogicalPlanAdapter) {
+                handleCacheStmt(cacheAnalyzer, channel);
+                return;
+            }
         }
 
         // handle select .. from xx  limit 0
@@ -1429,7 +1447,7 @@ public class StmtExecutor {
             if (cacheAnalyzer != null) {
                 if (cacheResult != null && cacheAnalyzer.getHitRange() == Cache.HitRange.Right) {
                     isSendFields =
-                            sendCachedValues(channel, cacheResult.getValuesList(), (SelectStmt) queryStmt, isSendFields,
+                            sendCachedValues(channel, cacheResult.getValuesList(), (Queriable) queryStmt, isSendFields,
                                     false);
                 }
 
@@ -2468,7 +2486,7 @@ public class StmtExecutor {
                     analyze(context.getSessionVariable().toThrift());
                 }
             } catch (Exception e) {
-                throw new RuntimeException("Failed to execute internal SQL", e);
+                throw new RuntimeException("Failed to execute internal SQL. " + Util.getRootCauseMessage(e), e);
             }
             planner.getFragments();
             RowBatch batch;
@@ -2478,7 +2496,7 @@ public class StmtExecutor {
                 QeProcessorImpl.INSTANCE.registerQuery(context.queryId(),
                         new QeProcessorImpl.QueryInfo(context, originStmt.originStmt, coord));
             } catch (UserException e) {
-                throw new RuntimeException("Failed to execute internal SQL", e);
+                throw new RuntimeException("Failed to execute internal SQL. " + Util.getRootCauseMessage(e), e);
             }
 
             Span queryScheduleSpan = context.getTracer()
@@ -2487,7 +2505,7 @@ public class StmtExecutor {
                 coord.exec();
             } catch (Exception e) {
                 queryScheduleSpan.recordException(e);
-                throw new RuntimeException("Failed to execute internal SQL", e);
+                throw new RuntimeException("Failed to execute internal SQL. " + Util.getRootCauseMessage(e), e);
             } finally {
                 queryScheduleSpan.end();
             }
@@ -2504,7 +2522,7 @@ public class StmtExecutor {
                 }
             } catch (Exception e) {
                 fetchResultSpan.recordException(e);
-                throw new RuntimeException("Failed to execute internal SQL", e);
+                throw new RuntimeException("Failed to execute internal SQL. " + Util.getRootCauseMessage(e), e);
             } finally {
                 fetchResultSpan.end();
             }

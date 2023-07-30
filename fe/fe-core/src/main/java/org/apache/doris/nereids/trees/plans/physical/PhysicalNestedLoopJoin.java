@@ -127,9 +127,13 @@ public class PhysicalNestedLoopJoin<
     @Override
     public PhysicalNestedLoopJoin<Plan, Plan> withChildren(List<Plan> children) {
         Preconditions.checkArgument(children.size() == 2);
-        return new PhysicalNestedLoopJoin<>(joinType,
+        PhysicalNestedLoopJoin newJoin = new PhysicalNestedLoopJoin<>(joinType,
                 hashJoinConjuncts, otherJoinConjuncts, markJoinSlotReference, Optional.empty(),
                 getLogicalProperties(), physicalProperties, statistics, children.get(0), children.get(1));
+        if (groupExpression.isPresent()) {
+            newJoin.setMutableState("group", groupExpression.get().getOwnerGroup().getGroupId().asInt());
+        }
+        return newJoin;
     }
 
     @Override
@@ -141,11 +145,12 @@ public class PhysicalNestedLoopJoin<
     }
 
     @Override
-    public PhysicalNestedLoopJoin<LEFT_CHILD_TYPE, RIGHT_CHILD_TYPE> withLogicalProperties(
-            Optional<LogicalProperties> logicalProperties) {
+    public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
+            Optional<LogicalProperties> logicalProperties, List<Plan> children) {
+        Preconditions.checkArgument(children.size() == 2);
         return new PhysicalNestedLoopJoin<>(joinType,
-                hashJoinConjuncts, otherJoinConjuncts, markJoinSlotReference, Optional.empty(),
-                logicalProperties.get(), left(), right());
+                hashJoinConjuncts, otherJoinConjuncts, markJoinSlotReference, groupExpression,
+                logicalProperties.get(), children.get(0), children.get(1));
     }
 
     @Override

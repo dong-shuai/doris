@@ -21,7 +21,9 @@
 package org.apache.doris.analysis;
 
 import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.HudiUtils;
 import org.apache.doris.catalog.TableIf;
+import org.apache.doris.catalog.Type;
 import org.apache.doris.catalog.external.HMSExternalTable;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
@@ -532,19 +534,41 @@ public class TableRef implements ParseNode, Writable {
             return;
         }
         TableIf.TableType tableType = this.getTable().getType();
-        if (tableType != TableIf.TableType.HMS_EXTERNAL_TABLE) {
-            ErrorReport.reportAnalysisException(ErrorCode.ERR_NONSUPPORT_TIME_TRAVEL_TABLE);
-        }
-        HMSExternalTable extTable = (HMSExternalTable) this.getTable();
-        if (extTable.getDlaType() != HMSExternalTable.DLAType.ICEBERG) {
-            ErrorReport.reportAnalysisException(ErrorCode.ERR_NONSUPPORT_TIME_TRAVEL_TABLE);
-        }
-        if (tableSnapshot.getType() == TableSnapshot.VersionType.TIME) {
-            String asOfTime = tableSnapshot.getTime();
-            Matcher matcher = TimeUtils.DATETIME_FORMAT_REG.matcher(asOfTime);
-            if (!matcher.matches()) {
-                throw new AnalysisException("Invalid datetime string: " + asOfTime);
+        if (tableType == TableIf.TableType.HMS_EXTERNAL_TABLE) {
+            HMSExternalTable extTable = (HMSExternalTable) this.getTable();
+            switch (extTable.getDlaType()) {
+                case ICEBERG:
+                    if (tableSnapshot.getType() == TableSnapshot.VersionType.TIME) {
+                        String asOfTime = tableSnapshot.getTime();
+                        Matcher matcher = TimeUtils.DATETIME_FORMAT_REG.matcher(asOfTime);
+                        if (!matcher.matches()) {
+                            throw new AnalysisException("Invalid datetime string: " + asOfTime);
+                        }
+                    }
+                    break;
+                case HUDI:
+                    if (tableSnapshot.getType() == TableSnapshot.VersionType.VERSION) {
+                        throw new AnalysisException("Hudi table only supports timestamp as snapshot ID");
+                    }
+                    try {
+                        tableSnapshot.setTime(HudiUtils.formatQueryInstant(tableSnapshot.getTime()));
+                    } catch (Exception e) {
+                        throw new AnalysisException("Failed to parse hudi timestamp: " + e.getMessage(), e);
+                    }
+                    break;
+                default:
+                    ErrorReport.reportAnalysisException(ErrorCode.ERR_NONSUPPORT_TIME_TRAVEL_TABLE);
             }
+        } else if (tableType == TableIf.TableType.ICEBERG_EXTERNAL_TABLE) {
+            if (tableSnapshot.getType() == TableSnapshot.VersionType.TIME) {
+                String asOfTime = tableSnapshot.getTime();
+                Matcher matcher = TimeUtils.DATETIME_FORMAT_REG.matcher(asOfTime);
+                if (!matcher.matches()) {
+                    throw new AnalysisException("Invalid datetime string: " + asOfTime);
+                }
+            }
+        } else {
+            ErrorReport.reportAnalysisException(ErrorCode.ERR_NONSUPPORT_TIME_TRAVEL_TABLE);
         }
     }
 
@@ -651,6 +675,9 @@ public class TableRef implements ParseNode, Writable {
             analyzer.setVisibleSemiJoinedTuple(semiJoinedTupleId);
             onClause.analyze(analyzer);
             analyzer.setVisibleSemiJoinedTuple(null);
+            if (!onClause.getType().isBoolean()) {
+                onClause = onClause.castTo(Type.BOOLEAN);
+            }
             onClause.checkReturnsBool("ON clause", true);
             if (onClause.contains(Expr.isAggregatePredicate())) {
                 throw new AnalysisException(

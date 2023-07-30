@@ -206,9 +206,11 @@ protected:
         return Status::OK();
     }
 
-    Status open_file_internal(const Path& file, int64_t file_size,
+    Status open_file_internal(const io::FileDescription& fd, const Path& abs_path,
                               io::FileReaderSPtr* reader) override {
-        return _local_fs->open_file(get_remote_path(file), io::FileReaderOptions::DEFAULT, reader);
+        io::FileDescription tmp_fd;
+        tmp_fd.path = get_remote_path(abs_path);
+        return _local_fs->open_file(tmp_fd, io::FileReaderOptions::DEFAULT, reader);
     }
 
     Status connect_impl() override { return Status::OK(); }
@@ -354,8 +356,16 @@ void createTablet(StorageEngine* engine, TabletSharedPtr* tablet, int64_t replic
     load_id.set_hi(0);
     load_id.set_lo(0);
 
-    WriteRequest write_req = {tablet_id, schema_hash, WriteType::LOAD,        txn_id, partition_id,
-                              load_id,   tuple_desc,  &(tuple_desc->slots()), false,  &param};
+    WriteRequest write_req = {tablet_id,
+                              schema_hash,
+                              txn_id,
+                              partition_id,
+                              load_id,
+                              tuple_desc,
+                              &(tuple_desc->slots()),
+                              false,
+                              &param};
+
     DeltaWriter* delta_writer = nullptr;
     std::unique_ptr<RuntimeProfile> profile;
     profile = std::make_unique<RuntimeProfile>("LoadChannels");
@@ -391,7 +401,9 @@ void createTablet(StorageEngine* engine, TabletSharedPtr* tablet, int64_t replic
 
     st = delta_writer->close();
     ASSERT_EQ(Status::OK(), st);
-    st = delta_writer->close_wait(PSlaveTabletNodes(), false);
+    st = delta_writer->build_rowset();
+    ASSERT_EQ(Status::OK(), st);
+    st = delta_writer->commit_txn(PSlaveTabletNodes(), false);
     ASSERT_EQ(Status::OK(), st);
     delete delta_writer;
 

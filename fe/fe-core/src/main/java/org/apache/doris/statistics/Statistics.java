@@ -111,8 +111,8 @@ public class Statistics {
             ColumnStatistic columnStatistic = entry.getValue();
             ColumnStatisticBuilder columnStatisticBuilder = new ColumnStatisticBuilder(columnStatistic);
             columnStatisticBuilder.setNdv(Math.min(columnStatistic.ndv, rowCount));
-            double numNulls = Math.min(columnStatistic.numNulls, rowCount - columnStatistic.ndv);
-            columnStatisticBuilder.setNumNulls(numNulls);
+            double nullFactor = (rowCount - columnStatistic.numNulls) / rowCount;
+            columnStatisticBuilder.setNumNulls(nullFactor * rowCount);
             columnStatisticBuilder.setCount(rowCount);
             statistics.addColumnStats(entry.getKey(), columnStatisticBuilder.build());
         }
@@ -242,5 +242,16 @@ public class Statistics {
                 }
             }
         }
+    }
+
+    public String detail(String prefix) {
+        StringBuilder builder = new StringBuilder();
+        builder.append(prefix).append("rows=").append(rowCount).append("\n");
+        builder.append(prefix).append("tupleSize=").append(computeTupleSize()).append("\n");
+
+        for (Entry<Expression, ColumnStatistic> entry : expressionToColumnStats.entrySet()) {
+            builder.append(prefix).append(entry.getKey()).append(" -> ").append(entry.getValue()).append("\n");
+        }
+        return builder.toString();
     }
 }

@@ -182,11 +182,6 @@ Status StorageEngine::start_bg_threads() {
             [this]() { this->_fd_cache_clean_callback(); }, &_fd_cache_clean_thread));
     LOG(INFO) << "fd cache clean thread started";
 
-    RETURN_IF_ERROR(Thread::create(
-            "StorageEngine", "clean_lookup_cache", [this]() { this->_start_clean_lookup_cache(); },
-            &_lookup_cache_clean_thread));
-    LOG(INFO) << "clean lookup cache thread started";
-
     // path scan and gc thread
     if (config::path_gc_check) {
         for (auto data_dir : get_stores()) {
@@ -243,11 +238,6 @@ Status StorageEngine::start_bg_threads() {
             .set_max_threads(config::tablet_publish_txn_max_thread)
             .build(&_tablet_publish_txn_thread_pool);
 
-    ThreadPoolBuilder("TabletCalcDeleteBitmapThreadPool")
-            .set_min_threads(1)
-            .set_max_threads(config::calc_delete_bitmap_max_thread)
-            .build(&_calc_delete_bitmap_thread_pool);
-
     RETURN_IF_ERROR(Thread::create(
             "StorageEngine", "aync_publish_version_thread",
             [this]() { this->_async_publish_callback(); }, &_async_publish_thread));
@@ -268,13 +258,6 @@ void StorageEngine::_fd_cache_clean_callback() {
         }
 
         _start_clean_cache();
-    }
-}
-
-void StorageEngine::_start_clean_lookup_cache() {
-    while (!_stop_background_threads_latch.wait_for(
-            std::chrono::seconds(config::tablet_lookup_cache_clean_interval))) {
-        LookupCache::instance().prune();
     }
 }
 
@@ -1216,6 +1199,11 @@ void StorageEngine::add_async_publish_task(int64_t partition_id, int64_t tablet_
                                            bool is_recovery) {
     if (!is_recovery) {
         TabletSharedPtr tablet = tablet_manager()->get_tablet(tablet_id);
+        if (tablet == nullptr) {
+            LOG(INFO) << "tablet may be dropped when add async publish task, tablet_id: "
+                      << tablet_id;
+            return;
+        }
         PendingPublishInfoPB pending_publish_info_pb;
         pending_publish_info_pb.set_partition_id(partition_id);
         pending_publish_info_pb.set_transaction_id(transaction_id);
@@ -1259,7 +1247,6 @@ void StorageEngine::_async_publish_callback() {
                 if (!tablet) {
                     LOG(WARNING) << "tablet does not exist when async publush, tablet_id: "
                                  << tablet_id;
-                    // TODO(liaoxin) remove pending publish info from db
                     tablet_iter = _async_publish_tasks.erase(tablet_iter);
                     continue;
                 }
@@ -1268,11 +1255,7 @@ void StorageEngine::_async_publish_callback() {
                 int64_t version = task_iter->first;
                 int64_t transaction_id = task_iter->second.first;
                 int64_t partition_id = task_iter->second.second;
-                int64_t max_version;
-                {
-                    std::shared_lock rdlock(tablet->get_header_lock());
-                    max_version = tablet->max_version().second;
-                }
+                int64_t max_version = tablet->max_version().second;
 
                 if (version <= max_version) {
                     need_removed_tasks.emplace_back(tablet, version);
