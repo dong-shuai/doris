@@ -188,6 +188,18 @@ public abstract class AbstractPlan extends AbstractTreeNode<Plan> implements Pla
     }
 
     @Override
+    public LogicalProperties computeLogicalProperties() {
+        boolean hasUnboundChild = children.stream()
+                .map(Plan::getLogicalProperties)
+                .anyMatch(UnboundLogicalProperties.class::isInstance);
+        if (hasUnboundChild || hasUnboundExpression()) {
+            return UnboundLogicalProperties.INSTANCE;
+        } else {
+            return new LogicalProperties(this::computeOutput);
+        }
+    }
+
+    @Override
     public Optional<Object> getMutableState(String key) {
         return mutableState.get(key);
     }
@@ -195,23 +207,6 @@ public abstract class AbstractPlan extends AbstractTreeNode<Plan> implements Pla
     @Override
     public void setMutableState(String key, Object state) {
         this.mutableState = this.mutableState.set(key, state);
-    }
-
-    /**
-     * used in treeString()
-     *
-     * @return "" if groupExpression is empty, o.w. string format of group id
-     */
-    public String getGroupIdAsString() {
-        String groupId;
-        if (getGroupExpression().isPresent()) {
-            groupId = "@" + groupExpression.get().getOwnerGroup().getGroupId().asInt();
-        } else if (getMutableState("group").isPresent()) {
-            groupId = "@" + getMutableState("group").get();
-        } else {
-            groupId = "";
-        }
-        return groupId;
     }
 
     @Override
